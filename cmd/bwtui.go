@@ -15,8 +15,10 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	l "github.com/charmbracelet/lipgloss"
 
-	bw "bitwarden-tui/internal"
-	"bitwarden-tui/internal/ui"
+	bw "bitwarden-tui/internal/backend"
+	"bitwarden-tui/internal/views/editor"
+	"bitwarden-tui/internal/views/item"
+	"bitwarden-tui/internal/views/notes"
 )
 
 const (
@@ -32,16 +34,15 @@ var (
 			Foreground(l.Color("#efefef")).
 			Background(l.Color(navyBlue)).
 			Padding(0, 1)
-
-	// subtitleStyle = l.NewStyle().Padding(0, 1).MarginLeft(2).Background(l.Color("#444"))
-	subtitleStyle = l.NewStyle().MarginLeft(2).Border(l.NormalBorder(), false, false, true, false).BorderBottomForeground(l.Color("#666"))
-
+	subtitleStyle = l.NewStyle().
+			MarginLeft(2).
+			Border(l.NormalBorder(), false, false, true, false).
+			BorderBottomForeground(l.Color("#666"))
 	statusMessageStyle = l.NewStyle().
 				Foreground(l.AdaptiveColor{Light: "14", Dark: "14"})
-
-	itemLabelStyle = l.NewStyle().Foreground(l.Color("#888")).MarginRight(1)
-
+	itemLabelStyle        = l.NewStyle().Foreground(l.Color("#888")).MarginRight(1)
 	selectedPropertyStyle = l.NewStyle().Foreground(l.Color(brightYellow))
+	errorLabelStyle       = l.NewStyle().Foreground(l.Color("9"))
 )
 
 type listItem struct {
@@ -50,7 +51,7 @@ type listItem struct {
 	description string
 }
 
-func (i listItem) Id() string          { return i.id }
+func (i listItem) ID() string          { return i.id }
 func (i listItem) Title() string       { return i.title }
 func (i listItem) Description() string { return i.description }
 func (i listItem) FilterValue() string { return i.title + " " + i.description }
@@ -81,9 +82,11 @@ func newListKeyMap() *listKeyMap {
 type view int
 
 const (
-	PASSINPUT view = iota
-	PASSLIST
-	PASSITEM
+	INPUT view = iota
+	LIST
+	ITEM
+	NOTES
+	EDITOR
 )
 
 type inputView struct {
@@ -103,16 +106,18 @@ type listView struct {
 }
 
 type model struct {
-	view      view
-	listView  listView
-	inputView inputView
-	itemView  itemView
-	bwContext *bw.Context
+	view       view
+	inputView  inputView
+	listView   listView
+	itemView   itemView
+	notesView  notes.Model
+	editorView editor.Model
+	bwClient   *bw.Client
 }
 
 // == MSG ==
 
-type sessionMsg *bw.Context
+type sessionMsg *bw.Client
 type itemMsg bw.Item
 type itemsMsg []bw.Item
 type errorMsg struct{ err error }
@@ -127,22 +132,22 @@ func raiseErr(s string) tea.Cmd {
 
 func (m *model) login() tea.Cmd {
 	return func() tea.Msg {
-		ctx, err := bw.InitializeClient(m.inputView.textInput.Value())
+		client, err := bw.New(m.inputView.textInput.Value())
 		if err != nil {
 			m.inputView.isLoading = false
-			return errorMsg{errors.New("Invalid master password!")}
+			return errorMsg{err}
 		}
 		m.inputView.isLoading = false
-		return sessionMsg(ctx)
+		return sessionMsg(client)
 	}
 }
 
 func (m *model) getItem() tea.Cmd {
 	return func() tea.Msg {
 		i := m.listView.list.SelectedItem().(listItem)
-		item, err := m.bwContext.GetItem(i.Id())
+		item, err := m.bwClient.GetItem(i.ID())
 		if err != nil || item == nil {
-			return errorMsg{errors.New("Failed to fetch item!")}
+			return errorMsg{errors.New("failed to fetch item")}
 		}
 		return itemMsg(*item)
 	}
@@ -150,16 +155,16 @@ func (m *model) getItem() tea.Cmd {
 
 func (m *model) getItems() tea.Cmd {
 	return func() tea.Msg {
-		items, err := m.bwContext.GetItems(bw.FilterOptions{})
+		items, err := m.bwClient.GetItems(bw.FilterOptions{})
 		if err != nil {
-			return errorMsg{errors.New("Failed to fetch items")}
+			return errorMsg{errors.New("failed to fetch items")}
 		}
 		return itemsMsg(items)
 	}
 }
 
 func (m *model) sync() tea.Cmd {
-	err := m.bwContext.Sync()
+	err := m.bwClient.Sync()
 	if err != nil {
 		return raiseErr("Sync failed!")
 	}
@@ -167,12 +172,32 @@ func (m *model) sync() tea.Cmd {
 	return m.getItems()
 }
 
+func getItemsAutomatically() ([]list.Item, error) {
+	client, err := bw.NewFromSessionKey(os.Getenv("BW_SESSION"))
+	if err != nil {
+		return nil, err
+	}
+	bwItems, err := client.GetItems(bw.FilterOptions{})
+	if err != nil {
+		return nil, err
+	}
+	items := listItemsFromBwItems(bwItems)
+	return items, err
+}
+
 func newModel() model {
 	var (
 		listKeys = newListKeyMap()
+		items    = []list.Item{}
+		client   = &bw.Client{}
+		view     = INPUT
 	)
 
-	items := []list.Item{}
+	listItems, err := getItemsAutomatically()
+	if err == nil {
+		items = listItems
+		view = LIST
+	}
 
 	listDelegate := list.NewDefaultDelegate()
 	listDelegate.Styles.SelectedTitle.Foreground(l.Color(brightYellow))
@@ -196,7 +221,7 @@ func newModel() model {
 	passList.Styles.FilterCursor.Foreground(l.Color(dimYellow))
 	passList.SetSpinner(spinner.MiniDot)
 	passList.StatusMessageLifetime = time.Duration(3 * time.Second)
-	listView := listView{
+	listViewComponent := listView{
 		list: passList,
 		keys: listKeys,
 	}
@@ -211,25 +236,35 @@ func newModel() model {
 	inputViewSpinner := spinner.New()
 	inputViewSpinner.Spinner = spinner.MiniDot
 	inputViewSpinner.Style = l.NewStyle().Foreground(l.Color("8"))
-	inputView := inputView{
+	inputViewComponent := inputView{
 		textInput: inputViewInput,
 		spinner:   inputViewSpinner,
 	}
 
-	itemView := itemView{}
-	itemView.item = item.New()
-	itemView.item.Styles = item.Styles{
+	itemViewComponent := itemView{}
+	itemViewComponent.item = item.New()
+	itemViewComponent.item.Styles = item.Styles{
 		Title:            titleStyle,
 		Subtitle:         subtitleStyle,
 		Label:            itemLabelStyle,
 		SelectedProperty: selectedPropertyStyle,
 	}
 
+	notesViewComponent := notes.New()
+
+	editorViewComponent := editor.New()
+	editorViewComponent.Styles = editor.Styles{
+		Title: titleStyle,
+	}
+
 	return model{
-		listView:  listView,
-		inputView: inputView,
-		itemView:  itemView,
-		view:      PASSINPUT,
+		listView:   listViewComponent,
+		inputView:  inputViewComponent,
+		itemView:   itemViewComponent,
+		notesView:  notesViewComponent,
+		editorView: editorViewComponent,
+		view:       view,
+		bwClient:   client,
 	}
 }
 
@@ -249,7 +284,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	switch m.view {
-	case PASSINPUT:
+	case INPUT:
 		{
 			switch msg := msg.(type) {
 			case tea.KeyMsg:
@@ -258,17 +293,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				case "ctrl+c", "ctrl+d":
 					return m, tea.Quit
 				case "enter":
-					if m.view == PASSINPUT {
+					if m.view == INPUT {
 						m.inputView.isLoading = true
 						return m, m.login()
 					}
 				}
 			case sessionMsg:
-				m.bwContext = msg
+				m.bwClient = msg
 				return m, m.getItems()
 			case itemsMsg:
 				items := listItemsFromBwItems(msg)
-				m.view = PASSLIST
+				m.view = LIST
 				m.inputView.isLoading = false
 				listCmd := m.listView.list.SetItems(items)
 				return m, listCmd
@@ -286,7 +321,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.inputView.textInput, inputCmd = m.inputView.textInput.Update(msg)
 			return m, tea.Batch(inputCmd, spinnerCmd)
 		}
-	case PASSLIST:
+	case LIST:
 		{
 			switch msg := msg.(type) {
 			case tea.KeyMsg:
@@ -298,8 +333,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					spinnerCmd := m.listView.list.StartSpinner()
 					return m, tea.Batch(spinnerCmd, m.getItem())
 				case key.Matches(msg, m.listView.keys.newItem):
-					cmd := m.listView.list.NewStatusMessage("new item!")
-					return m, cmd
+					// cmd := m.listView.list.NewStatusMessage("new item!")
+					m.view = EDITOR
+					return m, nil
 				case key.Matches(msg, m.listView.keys.sync):
 					spinnerCmd := m.listView.list.StartSpinner()
 					statusCmd := m.listView.list.NewStatusMessage("started syncing")
@@ -311,9 +347,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.listView.list.StopSpinner()
 				return m, listCmd
 			case itemMsg:
-				m.view = PASSITEM
+				m.view = ITEM
 				m.listView.list.StopSpinner()
 				m.itemView.item.Item = bw.Item(msg)
+        m.itemView.item.GenerateFields()
 				return m, nil
 			case errorMsg:
 				statusCmd := m.listView.list.NewStatusMessage(msg.err.Error())
@@ -323,18 +360,41 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.listView.list, listCmd = m.listView.list.Update(msg)
 			return m, listCmd
 		}
-	case PASSITEM:
+	case ITEM:
 		{
 			switch msg := msg.(type) {
 			case tea.KeyMsg:
 				switch {
 				case key.Matches(msg, m.itemView.item.KeyMap.Back):
-					m.view = PASSLIST
+					m.view = LIST
 				}
 			}
 			var itemCmd tea.Cmd
 			m.itemView.item, itemCmd = m.itemView.item.Update(msg)
 			return m, itemCmd
+		}
+	case NOTES:
+		{
+			switch msg := msg.(type) {
+			case tea.KeyMsg:
+				switch {
+				case key.Matches(msg, m.itemView.item.KeyMap.Back):
+					m.view = NOTES
+				}
+			}
+		}
+	case EDITOR:
+		{
+			switch msg := msg.(type) {
+			case tea.KeyMsg:
+				switch {
+				case key.Matches(msg, m.editorView.KeyMap.Back):
+					m.view = LIST
+				}
+			}
+			var editorCmd tea.Cmd
+			m.editorView, editorCmd = m.editorView.Update(msg)
+			return m, editorCmd
 		}
 	}
 
@@ -343,7 +403,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // == VIEW ==
 
-func renderInput(m model) string {
+func (m *model) renderInput() string {
 	var b strings.Builder
 	if m.inputView.isLoading {
 		b.WriteString(m.inputView.spinner.View() + " ")
@@ -354,27 +414,33 @@ func renderInput(m model) string {
 	b.WriteString(titleStyle.Render("BITWARDEN"))
 	b.WriteString("\n\n" + m.inputView.textInput.View())
 	if m.inputView.error != nil {
-		b.WriteString("\n\n" + l.NewStyle().Foreground(l.Color("9")).Render(m.inputView.error.Error()))
+		b.WriteString("\n\n" + errorLabelStyle.Render(m.inputView.error.Error()))
 	}
 	return appStyle.Render(b.String())
 }
-func renderList(m model) string {
+func (m *model) renderList() string {
 	out := m.listView.list.View()
 	return appStyle.Render(out)
 }
-func renderItem(m model) string {
+func (m *model) renderItem() string {
 	out := m.itemView.item.View()
+	return appStyle.Render(out)
+}
+func (m *model) renderEditor() string {
+	out := m.editorView.View()
 	return appStyle.Render(out)
 }
 
 func (m model) View() string {
 	switch m.view {
-	case PASSINPUT:
-		return renderInput(m)
-	case PASSLIST:
-		return renderList(m)
-	case PASSITEM:
-		return renderItem(m)
+	case INPUT:
+		return m.renderInput()
+	case LIST:
+		return m.renderList()
+	case ITEM:
+		return m.renderItem()
+	case EDITOR:
+		return m.renderEditor()
 	}
 	return "why am i here?"
 }

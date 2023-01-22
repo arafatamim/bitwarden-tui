@@ -1,21 +1,18 @@
 package item
 
 import (
-	bw "bitwarden-tui/internal"
-	"net/url"
 	"strings"
 	"time"
 
-	"github.com/atotto/clipboard"
+	bw "bitwarden-tui/internal/backend"
+
 	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
 
-var (
-	marginLeft = lipgloss.NewStyle().MarginLeft(2)
-)
+var marginLeft = lipgloss.NewStyle().MarginLeft(2)
 
 type statusTimeoutMsg struct{}
 
@@ -39,23 +36,23 @@ type ItemKeyMap struct {
 func newItemKeyMap() *ItemKeyMap {
 	return &ItemKeyMap{
 		Up: key.NewBinding(
-			key.WithKeys("up", "k"),
+			key.WithKeys("up", "k", "shift+tab"),
 			key.WithHelp("↑/k", "move up"),
 		),
 		Down: key.NewBinding(
-			key.WithKeys("down", "j"),
+			key.WithKeys("down", "j", "tab"),
 			key.WithHelp("↓/j", "move down"),
 		),
 		Back: key.NewBinding(
-			key.WithKeys("esc"),
+			key.WithKeys("esc", "backspace"),
 			key.WithHelp("esc", "go back"),
 		),
 		Copy: key.NewBinding(
 			key.WithKeys("enter", "c"),
-			key.WithHelp("enter/c", "copy property"),
+			key.WithHelp("enter/c", "copy/expand property"),
 		),
 		Quit: key.NewBinding(
-			key.WithKeys("q"),
+			key.WithKeys("q", "ctrl+c", "ctrl+d"),
 			key.WithHelp("q", "quit"),
 		),
 		OpenFullHelp: key.NewBinding(
@@ -74,6 +71,7 @@ func (k ItemKeyMap) ShortHelp() []key.Binding {
 		k.Up, k.Down, k.Copy, k.OpenFullHelp,
 	}
 }
+
 func (k ItemKeyMap) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
 		{k.Up, k.Down, k.Back},
@@ -82,14 +80,26 @@ func (k ItemKeyMap) FullHelp() [][]key.Binding {
 	}
 }
 
-type SelectedProperty int
+//====
 
-const (
-	USERNAME SelectedProperty = iota
-	PASSWORD
-	FIELDS
-	URI
-)
+type Field interface {
+	selectable() bool
+}
+
+type MaskedField struct {
+	Label string
+	Value string
+}
+
+func (*MaskedField) selectable() bool { return true }
+
+type SectionTitle struct {
+	Title string
+}
+
+func (*SectionTitle) selectable() bool { return false }
+
+//====
 
 type Model struct {
 	Item   bw.Item
@@ -97,11 +107,10 @@ type Model struct {
 	KeyMap *ItemKeyMap
 	Styles Styles
 
-	cursor             SelectedProperty
-	height             int
-	width              int
-	selectedUriIndex   uint8
-	selectedFieldIndex uint8
+	fields []Field
+	cursor int
+	height int
+	width  int
 
 	statusMessage      string
 	statusMessageTimer *time.Timer
@@ -125,13 +134,16 @@ func (m *Model) setSize(width, height int) {
 	m.Help.Width = width
 }
 
-func (m *Model) Cursor() SelectedProperty {
+func (m *Model) Cursor() int {
 	return m.cursor
 }
 
+/*
 func (m *Model) CursorDown() {
 	uriLen := len(m.Item.Login.Uris)
 	fieldLen := len(m.Item.Fields)
+	notes := m.Item.Notes
+
 	switch m.cursor {
 	case USERNAME:
 		m.cursor = PASSWORD
@@ -143,7 +155,7 @@ func (m *Model) CursorDown() {
 		} else {
 			m.cursor = USERNAME
 		}
-		m.selectedUriIndex = 0
+		m.selectedURIIndex = 0
 		m.selectedFieldIndex = 0
 	case FIELDS:
 		if m.selectedFieldIndex < uint8(fieldLen)-1 {
@@ -152,11 +164,17 @@ func (m *Model) CursorDown() {
 			m.cursor = URI
 		}
 	case URI:
-		if m.selectedUriIndex < uint8(uriLen)-1 {
-			m.selectedUriIndex += 1
+		if m.selectedURIIndex < uint8(uriLen)-1 {
+			m.selectedURIIndex += 1
 		} else {
-			m.cursor = USERNAME
+			if notes != nil {
+				m.cursor = NOTES
+			} else {
+				m.cursor = USERNAME
+			}
 		}
+	case NOTES:
+		m.cursor = USERNAME
 	}
 }
 
@@ -170,7 +188,7 @@ func (m *Model) CursorUp() {
 		} else {
 			m.cursor = PASSWORD
 		}
-		m.selectedUriIndex = uint8(uriLen) - 1
+		m.selectedURIIndex = uint8(uriLen) - 1
 		m.selectedFieldIndex = uint8(fieldLen) - 1
 	case PASSWORD:
 		m.cursor = USERNAME
@@ -181,17 +199,18 @@ func (m *Model) CursorUp() {
 			m.selectedFieldIndex--
 		}
 	case URI:
-		if m.selectedUriIndex == 0 {
+		if m.selectedURIIndex == 0 {
 			if fieldLen > 0 {
 				m.cursor = FIELDS
 			} else {
 				m.cursor = PASSWORD
 			}
 		} else {
-			m.selectedUriIndex--
+			m.selectedURIIndex--
 		}
 	}
 }
+*/
 
 func (m *Model) NewStatusMessage(s string) tea.Cmd {
 	m.statusMessage = s
@@ -212,6 +231,7 @@ func (m *Model) hideStatusMessage() {
 	}
 }
 
+/*
 func (m *Model) copySelected() tea.Cmd {
 	if clipboard.Unsupported {
 		return m.NewStatusMessage("clipboard unsupported!")
@@ -229,7 +249,7 @@ func (m *Model) copySelected() tea.Cmd {
 		toCopy = m.Item.Fields[m.selectedFieldIndex].Value
 		prop = "field"
 	case URI:
-		toCopy = m.Item.Login.Uris[m.selectedUriIndex].Uri
+		toCopy = m.Item.Login.Uris[m.selectedURIIndex].Uri
 		prop = "url"
 	}
 	err := clipboard.WriteAll(toCopy)
@@ -238,6 +258,7 @@ func (m *Model) copySelected() tea.Cmd {
 	}
 	return m.NewStatusMessage("copied " + prop)
 }
+*/
 
 func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 	var cmds []tea.Cmd
@@ -249,20 +270,13 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 		case key.Matches(msg, m.KeyMap.Quit):
 			return m, tea.Quit
 		case key.Matches(msg, m.KeyMap.Back):
-			m.cursor = USERNAME
-		case key.Matches(msg, m.KeyMap.Down):
-			m.CursorDown()
-		case key.Matches(msg, m.KeyMap.Up):
-			m.CursorUp()
-		case key.Matches(msg, m.KeyMap.OpenFullHelp), key.Matches(msg, m.KeyMap.CloseFullHelp):
-			m.Help.ShowAll = !m.Help.ShowAll
-		case key.Matches(msg, m.KeyMap.Copy):
-			cmds = append(cmds, m.copySelected())
+			m.cursor = 0
 		}
 	}
 	return m, tea.Batch(cmds...)
 }
 
+/*
 func (m *Model) renderCreds() string {
 	userLabel := m.Styles.Label.Render("Username")
 	passwordLabel := m.Styles.Label.Render("Password")
@@ -305,7 +319,7 @@ func (m *Model) renderCreds() string {
 func (m *Model) renderFields() string {
 	var b strings.Builder
 
-	maxTitleChars := getMax(bw.Map(m.Item.Fields, func(f bw.Field) string { return f.Name }))
+	maxTitleChars := getMax(bw.MapFields(m.Item.Fields, func(f bw.Field) string { return f.Name }))
 	for i, f := range m.Item.Fields {
 		titleChars := len(f.Name)
 		remainingChars := maxTitleChars - titleChars
@@ -338,12 +352,12 @@ func (m *Model) renderFields() string {
 	return b.String()
 }
 
-func (m *Model) renderUri() string {
+func (m *Model) renderURI() string {
 	var b strings.Builder
 	b.WriteString(m.Styles.Subtitle.Render("URIs") + "\n")
 	for i, u := range m.Item.Login.Uris {
 		parsed, err := url.Parse(u.Uri)
-		if m.cursor == URI && m.selectedUriIndex == uint8(i) {
+		if m.cursor == URI && m.selectedURIIndex == uint8(i) {
 			b.WriteString(m.Styles.SelectedProperty.Render("🢒 "+u.Uri) + "\n")
 		} else {
 			b.WriteString("  ")
@@ -358,61 +372,88 @@ func (m *Model) renderUri() string {
 	return b.String()
 }
 
-func (m *Model) renderNotes() string {
+func (m *Model) renderNote() string {
+	const label = "NOTES"
 	var b strings.Builder
-	b.WriteString(m.Styles.Subtitle.Render("Notes") + "\n")
-	b.WriteString(marginLeft.Render(m.Item.Notes))
+	if m.cursor == NOTES {
+		b.WriteString(m.Styles.SelectedProperty.Render("🢒 " + label))
+	} else {
+		b.WriteString("  " + label)
+	}
 	return b.String()
 }
+*/
 
 func (m Model) View() string {
-	item := m.Item
-
-	// title
-	title := m.Styles.Title.Copy().MarginLeft(2).Render(item.Name)
-	title += " " + m.statusMessage
-
-	creds := m.renderCreds()
-
-	// help
-	helpView := m.Help.View(*newItemKeyMap())
-
-	// gluing it together
 	var b strings.Builder
-	b.WriteString(title)
-	b.WriteString("\n\n" + creds)
-	if len(item.Fields) > 0 {
-		fields := m.renderFields()
-		b.WriteString("\n" + fields)
-	}
-	if len(item.Login.Uris) > 0 {
-		uris := m.renderUri()
-		b.WriteString("\n\n" + uris)
-	}
-	if item.Notes != "" {
-		notes := m.renderNotes()
-		b.WriteString("\n" + notes)
-	}
 
-	remainingHeight := m.height - (lipgloss.Height(b.String()) + lipgloss.Height(helpView) - 1)
-	if remainingHeight < 1 {
-		remainingHeight = 0
-	}
-	b.WriteString(strings.Repeat("\n", remainingHeight))
 
-	b.WriteString(marginLeft.Render(helpView))
+
+	for _, f := range m.fields {
+		switch f := f.(type) {
+		case *MaskedField:
+			b.WriteString(f.Label + "\n")
+		case *SectionTitle:
+			b.WriteString(f.Title + "\n")
+		}
+	}
 
 	return b.String()
+
+	/*
+		item := m.Item
+
+		// title
+		title := m.Styles.Title.Copy().MarginLeft(2).Render(item.Name)
+		title += " " + m.statusMessage
+
+		creds := m.renderCreds()
+
+		// help
+		helpView := m.Help.View(*newItemKeyMap())
+
+		// gluing it together
+		var b strings.Builder
+		b.WriteString(title)
+		b.WriteString("\n\n" + creds)
+		if len(item.Fields) > 0 {
+			fields := m.renderFields()
+			b.WriteString("\n" + fields)
+		}
+		if len(item.Login.Uris) > 0 {
+			uris := m.renderURI()
+			b.WriteString("\n\n" + uris)
+		}
+		if item.Notes != nil {
+			notes := m.renderNote()
+			b.WriteString("\n" + notes)
+		}
+
+		remainingHeight := m.height - (lipgloss.Height(b.String()) + lipgloss.Height(helpView) - 1)
+		if remainingHeight < 1 {
+			remainingHeight = 0
+		}
+		b.WriteString(strings.Repeat("\n", remainingHeight))
+
+		b.WriteString(marginLeft.Render(helpView))
+
+		return b.String()
+	*/
 }
 
 func New() Model {
 	return Model{
-		Item:               bw.Item{},
-		Help:               help.New(),
-		KeyMap:             newItemKeyMap(),
-		cursor:             USERNAME,
-		selectedUriIndex:   0,
-		selectedFieldIndex: 0,
+		fields: []Field{},
+		Item:   bw.Item{},
+		Help:   help.New(),
+		KeyMap: newItemKeyMap(),
+		cursor: 0,
+	}
+}
+
+func (m *Model) GenerateFields() {
+	m.fields = []Field{
+		&MaskedField{Label: "Username", Value: m.Item.Login.Username},
 	}
 }
 
